@@ -53,6 +53,13 @@ class JobWorker(threading.Thread):
             except processing.SizeExceededError as exc:
                 log.warning("job %s failed on size: %s", job["job_id"], exc)
                 self._fail(job, str(exc))
+            except processing.InvalidNameError as exc:
+                log.warning("job %s has an unsafe name: %s", job["job_id"], exc)
+                self._fail(job, f"invalid name: {exc}")
+            except processing.AttemptSuperseded as exc:
+                # The job row was failed/recovered or requeued elsewhere; the
+                # row already reflects that, so do not overwrite its status.
+                log.warning("job %s attempt superseded: %s", job["job_id"], exc)
             except Exception:
                 log.exception("job %s crashed", job["job_id"])
                 self._fail(job, "internal processing error")

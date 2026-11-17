@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS snapshot_lanes (
 _local = threading.local()
 
 
+class StaleJobError(Exception):
+    """Raised when a publish attempt no longer owns its job row."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -185,6 +189,21 @@ def heartbeat(job_id: str, instance_id: str) -> None:
     )
 
 
+def job_status(job_id: str) -> str | None:
+    """Current status of a job (None when the row does not exist)."""
+    row = get_conn().execute(
+        "SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    return None if row is None else row["status"]
+
+
+def job_owned_by(job_id: str, instance_id: str) -> bool:
+    """True iff the job is processing and still claimed by this instance."""
+    row = get_conn().execute(
+        "SELECT 1 FROM jobs WHERE job_id=? AND status='processing' "
+        "AND instance_id=?", (job_id, instance_id)).fetchone()
+    return row is not None
+
+
 def mark_failed(job_id: str, instance_id: str, error: str) -> None:
     with tx() as conn:
         conn.execute(
@@ -211,9 +230,26 @@ def requeue_job(job_id: str) -> bool:
     return True
 
 
-def publish_job(job_id: str, lane: str, counts: list[dict[str, Any]]) -> None:
-    """Publish metadata atomically; files are moved in beforehand."""
+def publish_job(job_id: str, lane: str, counts: list[dict[str, Any]],
+                instance_id: str | None = None) -> None:
+    """Publish metadata atomically; files are moved in beforehand.
+
+    The job must still be owned by this attempt: a stale attempt (its row was
+    requeued, failed or re-claimed elsewhere) must never mutate the published
+    set.  The caller is responsible for ensuring the lane directory exists
+    before this transaction commits.
+    """
     with tx() as conn:
+        if instance_id is None:
+            owned = conn.execute(
+                "SELECT 1 FROM jobs WHERE job_id=? AND status='processing'",
+                (job_id,)).fetchone()
+        else:
+            owned = conn.execute(
+                "SELECT 1 FROM jobs WHERE job_id=? AND status='processing' "
+                "AND instance_id=?", (job_id, instance_id)).fetchone()
+        if owned is None:
+            raise StaleJobError(f"job {job_id} is no longer processing")
         next_seq = conn.execute(
             "SELECT COALESCE(MAX(seq),0)+1 AS s FROM lane_publishes").fetchone()["s"]
         conn.execute(

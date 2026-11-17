@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
-from . import config, db, processing
+from . import config, db, naming, processing
 from .worker import JobWorker, new_instance_id
 
 _IO_CHUNK = 1024 * 1024
@@ -25,10 +25,22 @@ logging.basicConfig(
 )
 log = logging.getLogger("demux.api")
 
-_LANE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-_SAMPLE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _BASE_RE = re.compile(r"^[ACGT]{%d}$" % config.BARCODE_LEN)
 _RESERVED_PREFIX = "__"
+
+
+def _validate_lane_name(lane: object) -> str:
+    """Reject anything that is not one ordinary path component.
+
+    ``.``/``..`` resolve to the lanes root or its parent and must never be
+    accepted; checking before the upload is spooled guarantees rejected
+    names cannot touch existing data.
+    """
+    if not naming.is_valid_lane_name(lane):
+        raise HTTPException(
+            400, "invalid lane name: must be a single path component "
+                 "matching [A-Za-z0-9_.-]{1,64} and not '.' or '..'")
+    return lane
 
 
 def _validate_barcodes(raw: str) -> list[dict[str, str]]:
@@ -48,8 +60,12 @@ def _validate_barcodes(raw: str) -> list[dict[str, str]]:
         sid = item.get("sample_id")
         b1 = item.get("barcode_r1")
         b2 = item.get("barcode_r2")
-        if not isinstance(sid, str) or not _SAMPLE_RE.match(sid):
+        if not isinstance(sid, str):
             raise HTTPException(400, f"invalid sample_id: {sid!r}")
+        if not naming.is_valid_sample_id(sid):
+            raise HTTPException(
+                400, f"invalid sample_id: {sid!r} "
+                     "(must be a single path component, not '.' or '..')")
         if sid.startswith(_RESERVED_PREFIX):
             raise HTTPException(400, f"sample_id {sid!r} uses a reserved prefix")
         if not isinstance(b1, str) or not _BASE_RE.match(b1):
@@ -167,8 +183,7 @@ async def submit_job(
     r1: UploadFile = File(..., description="R1 gzip FASTQ"),
     r2: UploadFile = File(..., description="R2 gzip FASTQ"),
 ):
-    if not _LANE_RE.match(lane or ""):
-        raise HTTPException(400, "lane must match [A-Za-z0-9_.-]{1,64}")
+    lane = _validate_lane_name(lane)
     samples = _validate_barcodes(barcodes)
 
     existing = db.get_job_by_lane(lane)

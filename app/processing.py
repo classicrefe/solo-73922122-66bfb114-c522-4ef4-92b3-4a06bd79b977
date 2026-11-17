@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from . import config, db
+from . import config, db, naming
 
 QUARANTINE = "__quarantine__"
 _VALID_BASES = frozenset(b"ACGTN")
@@ -29,6 +29,17 @@ class FastqFormatError(Exception):
 
 class SizeExceededError(Exception):
     """Raised when decompressed input exceeds the 512 MiB budget."""
+
+
+class InvalidNameError(Exception):
+    """A job carries a lane/sample name that is not a safe path component."""
+
+
+class AttemptSuperseded(Exception):
+    """This attempt no longer owns its job; it must not publish."""
+    def __init__(self, job_id: str):
+        super().__init__(f"job {job_id} is no longer processing")
+        self.job_id = job_id
 
 
 @dataclass
@@ -190,6 +201,54 @@ def _lock_path(job_id: str) -> Path:
     return _work_dir(job_id) / "lock"
 
 
+def lane_directory(lane: str) -> Path:
+    """The one published directory that belongs to ``lane``.
+
+    Only a single ordinary path component is allowed, so the result is
+    always a direct child of the lanes root; ``.``/``..``/names with a
+    separator raise instead of resolving to the root, its parent or another
+    lane's directory.
+    """
+    if not naming.is_valid_lane_name(lane):
+        raise InvalidNameError(f"invalid lane name: {lane!r}")
+    candidate = config.LANES_DIR / lane
+    if candidate.parent != config.LANES_DIR:
+        raise InvalidNameError(f"lane {lane!r} escapes the lanes root")
+    return candidate
+
+
+def _staging_dir(job_id: str) -> Path:
+    """Staging namespace is keyed by job id, never by lane name."""
+    if not naming.is_safe_component(job_id):
+        raise InvalidNameError(f"invalid job id: {job_id!r}")
+    return config.STAGING_DIR / job_id
+
+
+def _validated_sample_ids(sample_rows) -> list[str]:
+    sample_ids = [r["sample_id"] for r in sample_rows]
+    for sid in sample_ids:
+        if not naming.is_valid_sample_id(sid):
+            raise InvalidNameError(f"invalid sample_id: {sid!r}")
+        if sid.startswith("__"):
+            raise InvalidNameError(f"reserved sample_id: {sid!r}")
+    return sample_ids
+
+
+def _remove_if_unpublished(path: Path) -> None:
+    """Remove ``path`` only when no publication references it.
+
+    Callers pass a directory already proven to belong to the lane being
+    processed; the publication check is the final guard against deleting a
+    lane that another task published.
+    """
+    if not path.exists():
+        return
+    row = db.get_conn().execute(
+        "SELECT 1 FROM lane_publishes WHERE lane=?", (path.name,)).fetchone()
+    if row is None:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def acquire_job_lock(job_id: str):
     """Exclusive flock held for the whole processing/publish cycle."""
     wd = _work_dir(job_id)
@@ -211,6 +270,8 @@ def process_job(job_row, instance_id: str) -> None:
     """Full lifecycle: split -> stage -> atomic publish -> metadata."""
     job_id = job_row["job_id"]
     lane = job_row["lane"]
+    final_publish = lane_directory(lane)
+    staging = _staging_dir(job_id)
     sample_rows = db.get_samples(job_id)
     keys = [
         SampleKey(
@@ -219,24 +280,24 @@ def process_job(job_row, instance_id: str) -> None:
         )
         for r in sample_rows
     ]
-    sample_ids = [r["sample_id"] for r in sample_rows]
+    sample_ids = _validated_sample_ids(sample_rows)
     r1_in = Path(job_row["r1_incoming"])
     r2_in = Path(job_row["r2_incoming"])
 
     lock = acquire_job_lock(job_id)
     work = _work_dir(job_id)
     staged = work / "output"
-    tmp_publish = config.PUBLISHED_DIR / "lanes" / f".tmp.{job_id}"
-    final_publish = config.PUBLISHED_DIR / "lanes" / lane
     try:
         # Remove leftovers from a previous crashed attempt of this same job.
         if staged.exists():
             shutil.rmtree(staged)
-        if tmp_publish.exists():
-            shutil.rmtree(tmp_publish)
-        if final_publish.exists() and db.get_conn().execute(
-                "SELECT 1 FROM lane_publishes WHERE lane=?", (lane,)).fetchone() is None:
-            shutil.rmtree(final_publish)
+        # Staging leftovers from an interrupted run are cleaned at startup,
+        # never by interpreting a user-supplied lane name.
+        if staging.exists():
+            shutil.rmtree(staging)
+        # An unpublished directory for this lane can only be debris from
+        # this or an earlier attempt; a published one is left untouched.
+        _remove_if_unpublished(final_publish)
 
         writers = _Writers(staged, sample_ids)
         counts = {s: 0 for s in sample_ids}
@@ -257,6 +318,11 @@ def process_job(job_row, instance_id: str) -> None:
                 counts[bucket] += 1
                 if pair_index % config.HEARTBEAT_FLUSH_EVERY == 0:
                     db.heartbeat(job_id, instance_id)
+                    # Stop promptly if this attempt lost ownership (the job
+                    # was failed/recovered or re-claimed by a newer attempt),
+                    # so it can never publish on top of newer work.
+                    if not db.job_owned_by(job_id, instance_id):
+                        raise AttemptSuperseded(job_id)
         finally:
             writers.close()
 
@@ -275,10 +341,24 @@ def process_job(job_row, instance_id: str) -> None:
                     raise FastqFormatError(
                         f"output {p.name} is not a valid gzip: {exc}") from exc
 
-        # Atomic same-filesystem move into the published tree.
-        tmp_publish.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged), str(tmp_publish))
-        os.rename(tmp_publish, final_publish)
+        # Stage inside the published filesystem, then atomically rename into
+        # the final lane directory.  Staging and lane names live in separate
+        # namespaces (published/.staging/<job> vs published/lanes/<lane>).
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staged), str(staging))
+        # Never replace a directory that is already published (a duplicate
+        # submission reuses the task; only debris can reach this point).
+        if final_publish.exists():
+            if db.get_conn().execute(
+                    "SELECT 1 FROM lane_publishes WHERE lane=?",
+                    (lane,)).fetchone() is not None:
+                raise RuntimeError(f"lane {lane} is already published")
+            shutil.rmtree(final_publish)
+        # The job must still be ours at the last moment before the files
+        # become visible; publish_job re-checks inside its transaction.
+        if not db.job_owned_by(job_id, instance_id):
+            raise AttemptSuperseded(job_id)
+        os.rename(staging, final_publish)
 
         count_rows = [
             {
@@ -289,7 +369,14 @@ def process_job(job_row, instance_id: str) -> None:
             }
             for bucket, n in counts.items()
         ]
-        db.publish_job(job_id, lane, count_rows)
+        try:
+            db.publish_job(job_id, lane, count_rows, instance_id)
+        except db.StaleJobError:
+            # A stale attempt lost its job row: the files it just moved are
+            # not referenced by any publication.  Remove only those; other
+            # lanes' published directories are never in scope.
+            _remove_if_unpublished(final_publish)
+            raise
 
         # Publish is durable; only now remove inputs and scratch space.
         for p in (r1_in, r2_in):
@@ -297,12 +384,13 @@ def process_job(job_row, instance_id: str) -> None:
                 p.unlink()
             except FileNotFoundError:
                 pass
-        incoming_dir = r1_in.parent
-        try:
-            incoming_dir.rmdir()
-        except OSError:
-            pass
+        # The upload directory is private to this job (plus its COMPLETE
+        # marker), so it can go once the lane is visible.
+        shutil.rmtree(r1_in.parent, ignore_errors=True)
         shutil.rmtree(work, ignore_errors=True)
+    except AttemptSuperseded:
+        # Leave the stage for the next attempt/recovery; never publish.
+        raise
     finally:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -336,6 +424,8 @@ def recover_on_startup() -> list[str]:
     published lanes."""
     notes: list[str] = []
     conn = db.get_conn()
+    jobs_by_id = {r["job_id"]: r for r in conn.execute(
+        "SELECT * FROM jobs").fetchall()}
 
     # 1. Jobs stuck in 'processing' whose owner lock is free (process dead).
     #    The flock is the authority: a live instance always holds it, so a
@@ -353,51 +443,72 @@ def recover_on_startup() -> list[str]:
             "WHERE job_id=?", (db.utcnow(), job["job_id"]))
         _remove_job_scratch(job, notes)
 
-    # 2. Orphan work directories with no processing job attached.
-    live_jobs = {
-        r["job_id"] for r in conn.execute(
-            "SELECT job_id FROM jobs WHERE status='processing'").fetchall()
-    }
+    # 2. Orphan work directories.  A directory whose job row is still
+    #    'processing' belongs to a live (or not yet recovered) owner and is
+    #    only removed via step 1.  A free lock plus a job row not processing
+    #    means the attempt is over; a lock-free directory with no row at all
+    #    is debris from an aborted publish.
     for wd in config.WORK_DIR.iterdir():
-        if not wd.is_dir() or wd.name in live_jobs:
+        if not wd.is_dir():
             continue
+        job = jobs_by_id.get(wd.name)
+        if job is not None and job["status"] == "processing":
+            continue  # live owner or handled by step 1
         lock = wd / "lock"
         if lock.exists() and not _lock_is_free(lock):
             continue  # owned by a live instance
-        if time.time() - wd.stat().st_mtime < 5:
+        if job is None and time.time() - wd.stat().st_mtime < 5:
             continue  # just created, likely a racing sibling
+        # Remove the job's staging area together with its scratch space, so
+        # a truly interrupted publish is reclaimed in one restart pass.
+        shutil.rmtree(config.STAGING_DIR / wd.name, ignore_errors=True)
         notes.append(f"removing orphan work directory {wd.name}")
         shutil.rmtree(wd, ignore_errors=True)
 
-    # 3. Unpublished staging directories left by a crashed publish.
-    lanes_root = config.PUBLISHED_DIR / "lanes"
+    # 3. Unpublished lane directories left by a crashed publish.
+    #    A directory is removable only if no publication row names it and no
+    #    live instance is currently publishing that lane.  The name is never
+    #    interpreted (".tmp.<x>" is a perfectly legal lane name), so files of
+    #    a successful ".tmp.instrument-42" publication are protected by the
+    #    DB row exactly like any other lane.
+    lanes_root = config.LANES_DIR
     if lanes_root.exists():
         published = {r["lane"] for r in conn.execute(
             "SELECT lane FROM lane_publishes").fetchall()}
-        jobs_by_id = {r["job_id"]: r for r in conn.execute(
-            "SELECT * FROM jobs").fetchall()}
         for child in lanes_root.iterdir():
-            if child.name.startswith(".tmp."):
-                job_id = child.name[len(".tmp."):]
-                job = jobs_by_id.get(job_id)
-                if job is not None and job["status"] == "processing" \
-                        and not _lock_is_free(_lock_path(job_id)):
+            if not child.is_dir() or child.name in published:
+                continue
+            guarded = False
+            for job in jobs_by_id.values():
+                if job["status"] != "processing" \
+                        or _lock_is_free(_lock_path(job["job_id"])):
                     continue
-                notes.append(f"removing unfinished publish staging {child.name}")
+                # A live owner publishing this lane, or (for a deployment
+                # upgraded mid-publish) still staging under the legacy
+                # ".tmp.<job>" name: protect it either way.
+                if job["lane"] == child.name \
+                        or child.name == f".tmp.{job['job_id']}":
+                    guarded = True
+                    break
+            if not guarded:
+                notes.append(
+                    f"removing unpublished lane directory {child.name}")
                 shutil.rmtree(child, ignore_errors=True)
-            elif child.name not in published:
-                # Complete-looking lane dir without a DB publish row: never
-                # visible; safe to remove unless a live owner is publishing.
-                guarded = False
-                for job in jobs_by_id.values():
-                    if job["lane"] == child.name and job["status"] == "processing" \
-                            and not _lock_is_free(_lock_path(job["job_id"])):
-                        guarded = True
-                        break
-                if not guarded:
-                    notes.append(
-                        f"removing unpublished lane directory {child.name}")
-                    shutil.rmtree(child, ignore_errors=True)
+
+    # 3b. Publish staging areas (separate namespace, keyed by job id).
+    #     Only staging whose job is not being actively processed is cleaned;
+    #     a truly interrupted staging area is removed and will be re-created
+    #     by the next attempt (restart-safe, idempotent).
+    if config.STAGING_DIR.exists():
+        for child in config.STAGING_DIR.iterdir():
+            if not child.is_dir():
+                continue
+            job = jobs_by_id.get(child.name)
+            if job is not None and job["status"] == "processing" \
+                    and not _lock_is_free(_lock_path(child.name)):
+                continue  # live publish in progress
+            notes.append(f"removing unfinished publish staging {child.name}")
+            shutil.rmtree(child, ignore_errors=True)
 
     # 4. Incoming debris of jobs that no longer need their uploads.
     #    A directory without a COMPLETE marker is an upload still streaming
@@ -431,10 +542,16 @@ def _remove_job_scratch(job_row, notes: list[str]) -> None:
     wd = _work_dir(job_id)
     if wd.exists():
         shutil.rmtree(wd, ignore_errors=True)
-    tmp = config.PUBLISHED_DIR / "lanes" / f".tmp.{job_id}"
+    tmp = _staging_dir(job_id)
     if tmp.exists():
         shutil.rmtree(tmp, ignore_errors=True)
-    final = config.PUBLISHED_DIR / "lanes" / lane
+    try:
+        final = lane_directory(lane)
+    except InvalidNameError:
+        # The row predates validation or was tampered with: never derive a
+        # filesystem path from it.
+        notes.append(f"skipped unsafe lane name for job {job_id!r}")
+        return
     if final.exists() and db.get_conn().execute(
             "SELECT 1 FROM lane_publishes WHERE lane=?",
             (lane,)).fetchone() is None:

@@ -29,6 +29,12 @@ DB_PATH = DATA_DIR / "demux.db"
 INCOMING_DIR = DATA_DIR / "incoming"
 WORK_DIR = DATA_DIR / "work"
 PUBLISHED_DIR = DATA_DIR / "published"
+# Published lane directories are the only children of this directory whose
+# names come from user input.
+LANES_DIR = PUBLISHED_DIR / "lanes"
+# Staging lives in its own namespace so a lane may legitimately be named
+# ".tmp.<anything>": staging and lane names can never be confused.
+STAGING_DIR = PUBLISHED_DIR / ".staging"
 
 # Hard limits from the task specification.
 MAX_SAMPLES = 8
@@ -37,5 +43,6 @@ MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024  # 512 MiB across both mates
 HEARTBEAT_FLUSH_EVERY = 256  # records between heartbeat writes
 POLL_INTERVAL = float(os.environ.get("DEMUX_POLL_INTERVAL", "1.0"))
 
-for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR):
+for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR, LANES_DIR,
+           STAGING_DIR):
     _d.mkdir(parents=True, exist_ok=True)

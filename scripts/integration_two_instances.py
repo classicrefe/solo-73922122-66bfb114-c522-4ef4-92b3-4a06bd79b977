@@ -201,6 +201,50 @@ def main() -> int:
         print("    laneIT0 counts:", counts)
         assert counts["__quarantine__"] == 2
 
+        print("[3b] '.'/'..' lane names rejected; published lanes untouched")
+        for bad in (".", ".."):
+            boundary, body = multipart(bad, barcodes, r1, r2)
+            code, resp = http("POST", f"{BASE_B}/jobs",
+                              raw_path=(boundary, body))
+            assert code == 400, (bad, code, resp)
+        for base in (BASE_A, BASE_B):
+            for path in ("/lanes/laneIT0/samples/sampleA/r1",
+                         "/lanes/laneIT0/quarantine/r2"):
+                code, body = http("GET", base + path)
+                assert code == 200 and len(body) > 0, (base, path, code)
+        code, resp = http("GET", f"{BASE_A}/lanes")
+        lanes_now = {row["lane"] for row in json.loads(resp)}
+        assert {"laneIT0", "laneITExtra"} <= lanes_now
+        print(f"    rejected without touching {len(lanes_now)} published lanes")
+
+        print("[3c] '.tmp.instrument-42' is a legal lane and survives recovery")
+        boundary, body = multipart(".tmp.instrument-42", barcodes, r1, r2)
+        code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))
+        assert code == 201, (code, resp)
+        tmp_jid = json.loads(resp)["job"]["job_id"]
+        assert wait_job(BASE_B, tmp_jid)["status"] == "published"
+        code, body = http(
+            "GET", f"{BASE_A}/lanes/.tmp.instrument-42/samples/sampleA/r1")
+        assert code == 200 and len(body) > 0
+        code, snap_tmp = http("POST", f"{BASE_A}/snapshots")
+        assert ".tmp.instrument-42" in json.loads(snap_tmp)["lanes"]
+        # Start a third instance on the same volume: its startup recovery
+        # must not mistake the published '.tmp.' lane directory for staging.
+        port_c = free_port()
+        c = start_instance(port_c, data_dir)
+        try:
+            code, body = http(
+                "GET",
+                f"http://127.0.0.1:{port_c}"
+                "/lanes/.tmp.instrument-42/quarantine/r1")
+            assert code == 200 and len(body) > 0, (code, body[:200])
+            code, body = http("GET", "http://127.0.0.1:%d/lanes/laneIT0" % port_c)
+            assert code == 200
+            print("    '.tmp.' lane downloadable after third-instance recovery")
+        finally:
+            stop(c)
+
+
         print("[4] snapshot fixes the lane list (later lane excluded)")
         code, snap = http("POST", f"{BASE_A}/snapshots")
         snap_id = json.loads(snap)["snapshot_id"]
@@ -212,6 +256,12 @@ def main() -> int:
         code, snap2 = http("GET", f"{BASE_B}/snapshots/{snap_id}")
         assert set(json.loads(snap2)["lanes"]) == before
         print(f"    snapshot keeps {len(before)} lanes; later lane excluded")
+
+        # The '.tmp.instrument-42' lane from [3c] was already published and
+        # is therefore part of this snapshot: it must download through it.
+        code, body = http(
+            "GET", f"{BASE_A}/snapshots/{snap_id}/samples/sampleA/r1")
+        assert code == 200 and len(body) > 0
 
         print("[5] duplicate lane reuses task; different input rejected (409)")
         boundary, body = multipart("laneIT0", barcodes, r1, r2)

@@ -21,7 +21,8 @@ def data_dir(tmp_path, monkeypatch):
     import importlib
     from app import config as cfg
     importlib.reload(cfg)
-    for sub in (cfg.INCOMING_DIR, cfg.WORK_DIR, cfg.PUBLISHED_DIR):
+    for sub in (cfg.INCOMING_DIR, cfg.WORK_DIR, cfg.PUBLISHED_DIR,
+                cfg.LANES_DIR, cfg.STAGING_DIR):
         sub.mkdir(parents=True, exist_ok=True)
     from app import db as dbmod
     importlib.reload(dbmod)

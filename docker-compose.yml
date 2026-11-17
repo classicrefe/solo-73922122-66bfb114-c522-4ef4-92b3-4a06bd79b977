@@ -1,43 +1,46 @@
+# Two API instances, one shared named volume, each capped at 128 MiB.
+#
+#   docker compose up --build
+#   instance A: http://localhost:8001/docs
+#   instance B: http://localhost:8002/docs
+#
+# Both instances run identical code against /data: SQLite WAL coordinates job
+# claiming, flock coordinates per-job work, and the published tree lives on
+# the shared volume.  Either instance can serve any published lane.
+x-demux: &demux
+  image: demux-api:latest
+  environment:
+    DEMUX_DATA_DIR: /data
+  volumes:
+    - demux-shared:/data
+  mem_limit: 128m
+  mem_reservation: 96m
+  init: true
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+    interval: 15s
+    timeout: 5s
+    start_period: 10s
+    retries: 3
+
 services:
   demux-a:
+    <<: *demux
     build: .
-    image: demux-api:latest
     container_name: demux-a
-    environment:
-      DEMUX_DATA_DIR: /data
     ports:
       - "8001:8000"
-    volumes:
-      - demux-shared:/data
-    mem_limit: 128m
-    mem_reservation: 96m
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
 
   demux-b:
-    image: demux-api:latest
+    <<: *demux
+    build: .
     container_name: demux-b
-    environment:
-      DEMUX_DATA_DIR: /data
     ports:
       - "8002:8000"
-    volumes:
-      - demux-shared:/data
-    mem_limit: 128m
-    mem_reservation: 96m
-    restart: unless-stopped
     depends_on:
       demux-a:
         condition: service_started
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
 
 volumes:
   demux-shared:
